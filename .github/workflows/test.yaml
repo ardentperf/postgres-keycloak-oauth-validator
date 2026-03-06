@@ -1,0 +1,171 @@
+name: Integration Tests
+
+on:
+  push:
+    branches:
+      - main
+      - 'x-ai/**'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: entra_validator integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate TLS certificates
+        run: |
+          mkdir -p test/certs
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+            -keyout test/certs/server.key \
+            -out    test/certs/server.crt \
+            -subj   "/CN=127.0.0.1" \
+            -addext "subjectAltName=IP:127.0.0.1,DNS:localhost"
+
+      - name: Build validator
+        run: |
+          docker build \
+            --target builder \
+            -t entra-validator-builder \
+            -f docker/Dockerfile \
+            .
+          mkdir -p test/so
+          docker create --name so-extractor entra-validator-builder /bin/true
+          docker cp so-extractor:/srv/build/entra_validator.so test/so/entra_validator.so
+          docker rm -f so-extractor
+
+      - name: Build test images
+        run: |
+          docker build -t entra-mock-oauth -f test/Dockerfile.mock-server test/
+          docker build -t entra-test-client -f test/Dockerfile.test-client test/
+
+      - name: Create Docker network
+        run: docker network create entra-test-net --driver bridge
+
+      - name: Start mock OAuth server
+        run: |
+          docker run -d --name entra-test-oauth \
+            --network entra-test-net \
+            -v "${{ github.workspace }}/test/certs:/certs:ro" \
+            -e MOCK_OAUTH_CERT=/certs/server.crt \
+            -e MOCK_OAUTH_KEY=/certs/server.key \
+            entra-mock-oauth 8443
+
+          # Wait for readiness
+          for i in $(seq 1 20); do
+            if docker exec entra-test-oauth python3 -c \
+              "import http.client, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; c=http.client.HTTPSConnection('127.0.0.1',8443,context=ctx); c.request('GET','/healthz'); r=c.getresponse(); exit(0 if r.status==200 else 1)" 2>/dev/null; then
+              echo "OAuth server ready"; break
+            fi
+            sleep 1
+            [ $i -lt 20 ] || { echo "OAuth server timeout"; docker logs entra-test-oauth; exit 1; }
+          done
+
+      - name: Start PostgreSQL
+        run: |
+          OAUTH_IP=$(docker inspect entra-test-oauth --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+          OAUTH_ISSUER="https://${OAUTH_IP}:8443"
+          echo "OAUTH_ISSUER=${OAUTH_ISSUER}" >> $GITHUB_ENV
+          echo "OAUTH_IP=${OAUTH_IP}" >> $GITHUB_ENV
+
+          # Generate PG server cert (self-signed, for SSL)
+          openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+            -keyout test/certs/pg.key \
+            -out    test/certs/pg.crt \
+            -subj   "/CN=postgres" 2>/dev/null
+
+          docker run -d --name entra-test-pg \
+            --network entra-test-net \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -e POSTGRES_PASSWORD=postgres \
+            -v "${{ github.workspace }}/test/so/entra_validator.so:/usr/lib/postgresql/18/lib/entra_validator.so:ro" \
+            -v "${{ github.workspace }}/test/certs/pg.crt:/etc/ssl/pg/server.crt:ro" \
+            -v "${{ github.workspace }}/test/certs/pg.key:/etc/ssl/pg/server.key:ro" \
+            ghcr.io/cloudnative-pg/postgresql:18-standard-trixie \
+            postgres
+
+          # Wait for readiness
+          for i in $(seq 1 30); do
+            if docker exec entra-test-pg pg_isready -U postgres 2>/dev/null; then break; fi
+            sleep 1
+            [ $i -lt 30 ] || { echo "PG timeout"; docker logs entra-test-pg; exit 1; }
+          done
+
+          # Configure
+          cat >> /tmp/pg-extra.conf <<EOF
+          oauth_validator_libraries = 'entra_validator'
+          entra.expected_issuer = '${OAUTH_ISSUER}'
+          entra.identity_claim = 'preferred_username'
+          entra.required_claim = 'roles'
+          entra.required_values = 'db_user,db_admin'
+          entra.debug = on
+          log_min_messages = debug1
+          ssl = on
+          ssl_cert_file = '/etc/ssl/pg/server.crt'
+          ssl_key_file = '/etc/ssl/pg/server.key'
+          EOF
+          docker cp /tmp/pg-extra.conf entra-test-pg:/tmp/pg-extra.conf
+          docker exec entra-test-pg bash -c "cat /tmp/pg-extra.conf >> /var/lib/postgresql/data/postgresql.conf"
+
+          cat > /tmp/pg_hba.conf <<EOF
+          local all all trust
+          hostssl all all 0.0.0.0/0 oauth issuer="${OAUTH_ISSUER}" scope="openid" validator="entra_validator"
+          host all all 0.0.0.0/0 trust
+          EOF
+          docker cp /tmp/pg_hba.conf entra-test-pg:/var/lib/postgresql/data/pg_hba.conf
+
+          cat > /tmp/pg_ident.conf <<EOF
+          entra testuser@example.com testuser
+          entra testuser2@example.com testuser2
+          EOF
+          docker cp /tmp/pg_ident.conf entra-test-pg:/var/lib/postgresql/data/pg_ident.conf
+
+          # Fix SSL key permissions
+          docker exec entra-test-pg bash -c "cp /etc/ssl/pg/server.key /var/lib/postgresql/server.key && chmod 600 /var/lib/postgresql/server.key && chown postgres /var/lib/postgresql/server.key"
+          docker exec entra-test-pg bash -c "sed -i 's|ssl_key_file.*|ssl_key_file = \"/var/lib/postgresql/server.key\"|' /var/lib/postgresql/data/postgresql.conf"
+
+          # Create roles and reload
+          docker exec entra-test-pg psql -U postgres -c "CREATE USER testuser LOGIN; CREATE USER testuser2 LOGIN; SELECT pg_reload_conf();"
+
+          PG_IP=$(docker inspect entra-test-pg --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
+          echo "PG_IP=${PG_IP}" >> $GITHUB_ENV
+
+      - name: Run integration tests
+        run: |
+          mkdir -p test/logs
+          docker run --rm \
+            --network entra-test-net \
+            -v "${{ github.workspace }}/test/certs/server.crt:/certs/oauth-ca.crt:ro" \
+            -e PGHOST="${{ env.PG_IP }}" \
+            -e PGPORT=5432 \
+            -e PGDATABASE=postgres \
+            -e PGUSER=postgres \
+            -e PGPASSWORD=postgres \
+            -e OAUTH_ISSUER="https://${{ env.OAUTH_IP }}:8443" \
+            -e OAUTH_CA_FILE=/certs/oauth-ca.crt \
+            entra-test-client 2>&1 | tee test/logs/test-output.log
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          docker logs entra-test-pg   > test/logs/postgres.log   2>&1 || true
+          docker logs entra-test-oauth > test/logs/oauth-server.log 2>&1 || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs
+          path: test/logs/
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f entra-test-pg entra-test-oauth 2>/dev/null || true
+          docker network rm entra-test-net 2>/dev/null || true

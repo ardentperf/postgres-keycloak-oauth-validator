@@ -1,33 +1,38 @@
 [![CloudNativePG](./logo/cloudnativepg.png)](https://cloudnative-pg.io/)
 
-# PostgreSQL OAuth Validator for Keycloak
+# PostgreSQL OAuth Validator for Microsoft Entra ID
 
-**EXPERIMENTAL**
+**EXPERIMENTAL** | Requires PostgreSQL 18+
 
-**Requires**: PostgreSQL 18+
+This module enables PostgreSQL 18 to validate OAuth tokens issued by
+Microsoft Entra ID (Azure AD). It performs **offline JWT claim-based
+validation** — no HTTP calls to an external authorization server are needed.
 
-This module enables PostgreSQL 18 to delegate authorization decisions to Keycloak using OAuth tokens, leveraging Keycloak Authorization Services for fine-grained, token-based access control.
-It sends a permission request to Keycloak's token endpoint using `grant_type=urn:ietf:params:oauth:grant-type:uma-ticket` and expects a decision response (`response_mode=decision`), which is a Keycloak-specific extension.
-It is designed for use with CloudNativePG, allowing database role elevation to be controlled by Keycloak policies.
+On each connection:
+1. The JWT `iss` claim is verified against `entra.expected_issuer` (if configured)
+2. The configured identity claim (default: `preferred_username`) is extracted
+   and used as the PostgreSQL `authn_id` for identity mapping
+3. Optionally, a roles/groups array claim is checked for required membership
+
+The module is designed for use with [CloudNativePG](https://cloudnative-pg.io/)
+and works with any OIDC provider that issues v2-style JWT access tokens
+(Entra ID, Auth0, Okta, etc.).
 
 ---
 
 ## Features
 
-- **Keycloak-based authorization for PostgreSQL roles**
-  - Delegates database role elevation decisions to Keycloak Authorization Services using OAuth tokens.
-- **Permission string construction**
-  - Builds permission strings as `<resource_name>#<scope>` and sends permission requests to Keycloak's token endpoint (`grant_type=urn:ietf:params:oauth:grant-type:uma-ticket`, `response_mode=decision`).
+- **Offline JWT validation** — no network calls per connection
+- **Configurable identity claim** — use `preferred_username`, `email`, `oid`, `sub`, etc.
+- **Flexible authorization** — optional check for required roles/groups
+- **Multi-value authorization** — `entra.required_values` accepts a comma-separated
+  list; any matching value grants access
+- **Identity-only mode** — skip authorization checks entirely (just map identity)
 - **Configurable via PostgreSQL GUC parameters**
-  - All integration settings (endpoints, resource names, timeouts, debug, etc.) are controlled via GUCs.
-- **Secure HTTP communication**
-  - Uses libcurl for HTTP requests with configurable timeouts and safe logging.
-- **Optional JWT issuer verification**
-  - Can verify the `iss` claim in JWT tokens for additional security.
 
 ---
 
-## Example: CloudNativePG Configuration
+## Quick Start: CloudNativePG
 
 ```yaml
 apiVersion: postgresql.cnpg.io/v1
@@ -40,85 +45,91 @@ spec:
 
   postgresql:
     extensions:
-      - name: keycloak-oauth-validator
+      - name: entra-validator
         ld_library_path:
           - system
         image:
-          reference: ghcr.io/cloudnative-pg/postgres-keycloak-oauth-validator-testing:18-dev-trixie
+          reference: ghcr.io/ardentperf/postgres-entra-oauth-validator:18-dev-trixie
     parameters:
-      oauth_validator_libraries: "kc_validator"
-      kc.token_endpoint: "https://<keycloak>/realms/<realm>/protocol/openid-connect/token"
-      kc.audience: "postgres-resource"
-      kc.resource_name: "appdb"       # Resource name in Keycloak
-      kc.client_id: "postgres-resource"
-      kc.http_timeout_ms: "2000"
-      kc.expected_issuer: "https://<keycloak>/realms/<realm>"
-      kc.debug: "on"
-      kc.log_body: "on"
-      log_min_messages: "debug1"
+      oauth_validator_libraries: "entra_validator"
+      entra.expected_issuer: "https://login.microsoftonline.com/TENANT_ID/v2.0"
+      entra.identity_claim: "preferred_username"
+      entra.required_claim: "roles"
+      entra.required_values: "db_user,db_admin"
+      entra.debug: "on"
     pg_hba:
-      - host all all 0.0.0.0/0 oauth issuer="https://<keycloak>/realms/<realm>" scope=db_access validator="kc_validator" delegate_ident_mapping=1
+      - hostssl all all 0.0.0.0/0 oauth issuer="https://login.microsoftonline.com/TENANT_ID/v2.0" scope="api://APP_ID/pg_access" validator="entra_validator"
 ```
 
-For a full example, see `examples/cnpg/cluster.yaml`.
+For a complete example, see [`examples/cnpg/cluster.yaml`](examples/cnpg/cluster.yaml).
 
 ---
 
-## Keycloak Configuration Steps
+## GUC Parameters
 
-1. **Realm**
-   Create or use an existing realm (e.g., `demo`).
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `entra.expected_issuer` | string | NULL | Expected JWT `iss` claim. If set, tokens with a different issuer are rejected. Example: `https://login.microsoftonline.com/TENANT_ID/v2.0` |
+| `entra.identity_claim` | string | `preferred_username` | JWT claim to use as `authn_id`. Use with `pg_ident` to map to PG roles. |
+| `entra.required_claim` | string | NULL | JWT array claim to check for authorization (e.g., `roles`, `groups`). If NULL, authorization is always granted. |
+| `entra.required_values` | string | NULL | Comma-separated list of allowed values. Authorization succeeds if the `required_claim` array contains **any** of these values. E.g., `db_user,db_admin` |
+| `entra.debug` | bool | `off` | Enable verbose debug logging. Does not log token content. |
 
-2. **Resource Server Client** (`kc.audience`)
-   Create a client for Authorization Services (e.g., `postgres-resource`).
-   Enable Authorization Services and add scopes as needed (e.g., `app_readonly`, `app_readwrite`).
-
-3. **Validator Client** (`kc.client_id`)
-   A client allowed to call the token endpoint for permission decisions.
-
-4. **Resource & Permission**
-   Resource name: `<kc.resource_name>` (e.g., `appdb`).
-   Scope name: `<scope>` (e.g., `app_readonly`, `app_readwrite`).
-   Permission name: `<resource_name>#<scope>` (e.g., `appdb#app_readonly`).
-   Create a permission for each database role you want to allow (e.g., DB role `app_readonly` maps to Keycloak scope `app_readonly`, permission name `appdb#app_readonly`).
-
-5. **Policies**
-   Attach policies to permissions so that only intended users can access specific scopes.
-
-6. **Issuer Verification (optional)**
-   Set `kc.expected_issuer` to your realm's issuer URL (e.g., `https://<keycloak>/realms/<realm>`).
+All GUCs are reloadable via `SIGHUP` / `SELECT pg_reload_conf()`.
 
 ---
 
-## Quick Start with psql and Device Flow
+## Entra ID Setup
 
-You can quickly test the validator using Keycloak's Device Flow and psql:
+### App Registration
 
-1. **Connect to PostgreSQL using psql with OAuth parameters:**
+1. Go to [portal.azure.com](https://portal.azure.com) → **Entra ID** → **App registrations** → **New registration**
+2. Name: `pg-oauth-lab`, Supported account types: single tenant
+3. Click **Register**
+4. Note the **Application (client) ID** and **Directory (tenant) ID**
 
-    ```bash
-    psql "host=<keycloak> \
-        user=app_readonly \
-        dbname=appdb \
-        oauth_issuer=https://<keycloak>/realms/demo \
-        oauth_client_id=appA \
-        oauth_client_secret=<client secret> \
-        oauth_scope='db_access'"
-    ```
+### Enable Device Flow
 
-    When you run this command, psql will display a Device Authorization URL and a device code.
+1. In your app registration → **Authentication**
+2. Under **Advanced settings** → **Allow public client flows** → **Yes**
+3. Click **Save**
 
-2. **Authenticate via browser:**
+### Expose an API
 
-    - Open the displayed URL in your browser.
-    - Enter the device code shown by psql.
-    - Log in with your Keycloak username and password.
+1. **Expose an API** → **Add a scope**
+2. Set Application ID URI (accept the default or set `api://APP_ID`)
+3. Scope name: `pg_access`, Admin consent: **Yes**, click **Add scope**
 
-    Once authentication is complete, psql will automatically obtain an access token and connect to the database.
+### Add App Roles (for role-based access)
 
-> Note:
-The DB role (`app_readonly`) should match the Keycloak scope name.
-The validator will request permission `<resource_name>#<scope>` (e.g., `appdb#app_readonly`) from Keycloak Authorization Services.
+1. **App roles** → **Create app role**
+2. Display name: `Database User`, Value: `db_user`, Allowed member types: Users/Groups
+3. Repeat for any additional roles
+4. Go to **Enterprise Applications** → find your app → **Users and groups** → assign your user to the `db_user` role
+
+### Set Token Version
+
+1. **Manifest** → set `"accessTokenAcceptedVersion": 2` → **Save**
+
+---
+
+## psql Device Flow
+
+```bash
+psql "host=<your-pg-host> \
+    user=<your-pg-username> \
+    dbname=<dbname> \
+    oauth_issuer=https://login.microsoftonline.com/TENANT_ID/v2.0 \
+    oauth_client_id=APP_ID \
+    oauth_scope='api://APP_ID/pg_access'"
+```
+
+psql will display a device code URL. Open it in a browser, sign in with your
+Entra account, then psql will automatically obtain the token and connect.
+
+Your PostgreSQL username must match the value of the configured `identity_claim`
+(default: `preferred_username`, i.e., your Entra UPN like `user@domain.com`)
+unless a `pg_ident` map is used to translate it.
 
 ---
 
@@ -126,43 +137,33 @@ The validator will request permission `<resource_name>#<scope>` (e.g., `appdb#ap
 
 ### Local
 
-To compile the extension is required [meson](https://mesonbuild.com/) tool.
-
 ```bash
 meson setup build
 meson compile -C build
 ```
-The extension will be located inside the `build/` directory, that was
-created during the setup process.
+
+The compiled `entra_validator.so` will be in the `build/` directory.
 
 ### Docker
 
-A simple possibility is to build the image using a plain docker build
-command:
-
 ```bash
-docker build -t pg-kc-validator -f docker/Dockerfile .
-```
-
-To have all the possible labels, annotations, SBOMS, etc. the
-image can be built using Docker Bake:
-
-```bash
-docker buildx bake
+docker build -t entra-validator -f docker/Dockerfile .
 ```
 
 ---
 
 ## Security Notes
 
-- Do not use self-signed certificates (server.crt) in production; always use a trusted CA.
-- Enable `kc.log_body` only for debugging; keep it `off` in production.
-- Place CA certificates in `/usr/local/share/ca-certificates/` and run `update-ca-certificates` in your Docker image.
+- No cryptographic JWT signature verification is performed. The token is trusted
+  based on the transport-layer security of the PostgreSQL connection (TLS) and
+  the issuer claim check. For production use, ensure `ssl = on` and restrict
+  pg_hba to `hostssl`.
+- Set `entra.debug = off` in production to minimize log verbosity.
+- The `preferred_username` claim can be spoofed if the access token is obtained
+  by a malicious client; always ensure tokens are issued by the expected issuer.
 
 ---
 
 ## License
 
-Apache-2.0. See `LICENSE`.
-
----
+Apache-2.0. See [`LICENSE`](LICENSE).

@@ -57,12 +57,12 @@ variable "pgVersions" {
   ]
 }
 
-fullname = ( environment == "testing") ? "${registry}/postgres-keycloak-oauth-validator-testing" : "${registry}/postgres-keycloak-oauth-validator"
+fullname = (environment == "testing") ? "${registry}/postgres-entra-oauth-validator-testing" : "${registry}/postgres-entra-oauth-validator"
 
-title = "PostgreSQL OAuth validator module for Keycloak"
-description = "This module enables PostgreSQL to delegate authorization decisions to Keycloak using OAuth tokens, leveraging Keycloak Authorization Services for fine-grained, token-based access control."
+title = "PostgreSQL OAuth validator module for Microsoft Entra ID"
+description = "This module enables PostgreSQL to validate OAuth tokens issued by Microsoft Entra ID (Azure AD), using offline JWT claim-based identity and authorization checks. Designed for use with CloudNativePG."
 authors = "The CloudNativePG Contributors"
-url = "https://github.com/cloudnative-pg/postgres-keycloak-oauth-validator"
+url = "https://github.com/ardentperf/postgres-entra-oauth-validator"
 documentation = "https://cloudnative-pg.io/"
 license = "Apache-2.0"
 now = timestamp()
