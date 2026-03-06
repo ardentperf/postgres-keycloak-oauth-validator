@@ -2,18 +2,20 @@ FROM debian:trixie-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 
+# Install PostgreSQL 18 client from the official PGDG APT repository
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    openssl \
     ca-certificates \
-    postgresql-client \
-    libpq-dev \
+    gnupg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+       | gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] https://apt.postgresql.org/pub/repos/apt trixie-pgdg main 18" \
+       > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+       postgresql-client-18 \
+       libpq-oauth \
     && rm -rf /var/lib/apt/lists/*
-
-# Install libpq-oauth if available (PG 18 OAuth SASL support)
-# It may be packaged as part of postgresql-client on trixie
-RUN apt-cache show libpq-oauth 2>/dev/null && \
-    apt-get install -y --no-install-recommends libpq-oauth || true
 
 COPY run_tests.sh /app/run_tests.sh
 RUN chmod +x /app/run_tests.sh

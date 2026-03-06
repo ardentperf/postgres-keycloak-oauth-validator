@@ -237,10 +237,12 @@ class OAuthHandler(http.server.BaseHTTPRequestHandler):
             claims["preferred_username"] = "altuser@example.com"
             claims["roles"] = ["db_user"]
 
-        # Allow test to override individual claims
+        # Allow test to override individual claims.
+        # Setting a claim value to null removes it from the token.
         claim_overrides = self._get_param("claims", {})
         if claim_overrides:
             claims.update(claim_overrides)
+            claims = {k: v for k, v in claims.items() if v is not None}
 
         return _make_jwt(claims, port)
 
@@ -268,7 +270,10 @@ class OAuthHandler(http.server.BaseHTTPRequestHandler):
 
     def config(self) -> JsonObject:
         port = self.server.socket.getsockname()[1]
-        issuer = f"https://127.0.0.1:{port}"
+        # Use the Host header so the issuer matches whatever oauth_issuer psql was given.
+        # Fall back to 127.0.0.1 if no Host header.
+        host = self.headers.get("Host", f"127.0.0.1:{port}")
+        issuer = f"https://{host}"
         if self._alt_issuer:
             issuer += "/alternate"
         elif self._parameterized:
@@ -358,7 +363,7 @@ class OAuthHandler(http.server.BaseHTTPRequestHandler):
 def main():
     port_arg = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
-    s = http.server.HTTPServer(("127.0.0.1", port_arg), OAuthHandler)
+    s = http.server.HTTPServer(("0.0.0.0", port_arg), OAuthHandler)
 
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_context.load_cert_chain(ssl_cert, ssl_key)
