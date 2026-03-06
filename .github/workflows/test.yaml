@@ -22,9 +22,7 @@ jobs:
       - name: Generate TLS certificates
         run: |
           mkdir -p test/certs
-          # Use the container hostname "entra-test-oauth" as the SAN.
-          # Docker's internal DNS resolves container names within the network,
-          # so psql can reach the mock server as https://entra-test-oauth:8443
+          # Use the container name as the SAN so Docker's internal DNS resolves it.
           openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
             -keyout test/certs/server.key \
             -out    test/certs/server.crt \
@@ -61,7 +59,6 @@ jobs:
             -e MOCK_OAUTH_KEY=/certs/server.key \
             entra-mock-oauth 8443
 
-          # Wait for readiness
           for i in $(seq 1 20); do
             if docker exec entra-test-oauth python3 -c \
               "import http.client, ssl; ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE; c=http.client.HTTPSConnection('127.0.0.1',8443,context=ctx); c.request('GET','/healthz'); r=c.getresponse(); exit(0 if r.status==200 else 1)" 2>/dev/null; then
@@ -73,17 +70,14 @@ jobs:
 
       - name: Start PostgreSQL
         run: |
-          # Use the container name as hostname — Docker DNS resolves it within the network
           OAUTH_ISSUER="https://entra-test-oauth:8443"
           echo "OAUTH_ISSUER=${OAUTH_ISSUER}" >> $GITHUB_ENV
 
-          # Generate PG server cert (self-signed, for SSL)
           openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
             -keyout test/certs/pg.key \
             -out    test/certs/pg.crt \
             -subj   "/CN=postgres" 2>/dev/null
 
-          # Use standard postgres:18 image (trixie, same ABI as builder)
           docker run -d --name entra-test-pg \
             --network entra-test-net \
             -e POSTGRES_PASSWORD=postgres \
@@ -92,61 +86,54 @@ jobs:
             -v "${{ github.workspace }}/test/certs/pg.key:/tmp/pg-server.key:ro" \
             postgres:18
 
-          # Wait for readiness
           for i in $(seq 1 30); do
             if docker exec entra-test-pg pg_isready -U postgres 2>/dev/null; then break; fi
             sleep 1
             [ $i -lt 30 ] || { echo "PG timeout"; docker logs entra-test-pg; exit 1; }
           done
 
-          # Fix SSL key permissions (must be owned by postgres, mode 600)
           docker exec entra-test-pg bash -c "
-            cp /tmp/pg-server.key /var/lib/postgresql/pg-server.key
-            chmod 600 /var/lib/postgresql/pg-server.key
+            cp /tmp/pg-server.key /var/lib/postgresql/pg-server.key &&
+            chmod 600 /var/lib/postgresql/pg-server.key &&
             chown postgres /var/lib/postgresql/pg-server.key
           "
-
-          # Write extra configuration (no leading whitespace — heredoc at col 0)
-          cat > /tmp/pg-extra.conf <<'PGCONF'
-oauth_validator_libraries = 'entra_validator'
-entra.identity_claim = 'preferred_username'
-entra.required_claim = 'roles'
-entra.required_values = 'db_user,db_admin'
-entra.debug = on
-log_min_messages = debug1
-ssl = on
-ssl_cert_file = '/tmp/pg-server.crt'
-ssl_key_file = '/var/lib/postgresql/pg-server.key'
-PGCONF
-          # Append issuer with runtime value.
-          # Tests use the /param issuer so the mock server decodes claim overrides
-          # from client_id. entra.expected_issuer must match the JWT iss claim.
-          echo "entra.expected_issuer = '${OAUTH_ISSUER}/param'" >> /tmp/pg-extra.conf
 
           PGDATA=$(docker exec entra-test-pg psql -U postgres -tAc "SHOW data_directory;")
           echo "PGDATA=${PGDATA}" >> $GITHUB_ENV
 
+          # Write postgresql.conf additions using printf to avoid YAML heredoc issues
+          printf '%s\n' \
+            "oauth_validator_libraries = 'entra_validator'" \
+            "entra.identity_claim = 'preferred_username'" \
+            "entra.required_claim = 'roles'" \
+            "entra.required_values = 'db_user,db_admin'" \
+            "entra.debug = on" \
+            "log_min_messages = debug1" \
+            "ssl = on" \
+            "ssl_cert_file = '/tmp/pg-server.crt'" \
+            "ssl_key_file = '/var/lib/postgresql/pg-server.key'" \
+            "entra.expected_issuer = '${OAUTH_ISSUER}/param'" \
+            > /tmp/pg-extra.conf
           docker cp /tmp/pg-extra.conf entra-test-pg:/tmp/pg-extra.conf
           docker exec entra-test-pg bash -c "cat /tmp/pg-extra.conf >> ${PGDATA}/postgresql.conf"
 
-          # Write pg_hba.conf (no leading whitespace)
-          cat > /tmp/pg_hba.conf <<PGCONF
-local all all trust
-hostssl all all 0.0.0.0/0 oauth issuer="${OAUTH_ISSUER}/param" scope="openid" validator="entra_validator" map="entra"
-host all all 0.0.0.0/0 trust
-PGCONF
+          # pg_hba.conf: allow trust for local + SSL oauth for remote
+          printf '%s\n' \
+            "local all all trust" \
+            "hostssl all all 0.0.0.0/0 oauth issuer=\"${OAUTH_ISSUER}/param\" scope=\"openid\" validator=\"entra_validator\" map=\"entra\"" \
+            "host all all 0.0.0.0/0 trust" \
+            > /tmp/pg_hba.conf
           docker cp /tmp/pg_hba.conf entra-test-pg:/tmp/pg_hba.conf
           docker exec entra-test-pg bash -c "cp /tmp/pg_hba.conf ${PGDATA}/pg_hba.conf"
 
-          # Write pg_ident.conf (no leading whitespace)
-          cat > /tmp/pg_ident.conf <<'PGCONF'
-entra testuser@example.com testuser
-entra testuser2@example.com testuser2
-PGCONF
+          # pg_ident.conf: map Entra preferred_username to PG roles
+          printf '%s\n' \
+            "entra testuser@example.com testuser" \
+            "entra testuser2@example.com testuser2" \
+            > /tmp/pg_ident.conf
           docker cp /tmp/pg_ident.conf entra-test-pg:/tmp/pg_ident.conf
           docker exec entra-test-pg bash -c "cp /tmp/pg_ident.conf ${PGDATA}/pg_ident.conf"
 
-          # Create roles and reload config
           docker exec entra-test-pg psql -U postgres -c \
             "CREATE USER testuser LOGIN; CREATE USER testuser2 LOGIN; SELECT pg_reload_conf();"
 
@@ -156,7 +143,8 @@ PGCONF
       - name: Run integration tests
         run: |
           mkdir -p test/logs
-          # Install the mock server's cert into the system store so psql/libcurl trusts it
+          # Install the mock server's self-signed cert into the system CA store
+          # so psql/libcurl trusts it when fetching the OIDC discovery document.
           docker run --rm \
             --network entra-test-net \
             -v "${{ github.workspace }}/test/certs/server.crt:/usr/local/share/ca-certificates/mock-oauth.crt:ro" \
@@ -175,7 +163,7 @@ PGCONF
         if: failure()
         run: |
           mkdir -p test/logs
-          docker logs entra-test-pg   > test/logs/postgres.log   2>&1 || true
+          docker logs entra-test-pg    > test/logs/postgres.log    2>&1 || true
           docker logs entra-test-oauth > test/logs/oauth-server.log 2>&1 || true
 
       - name: Upload logs
