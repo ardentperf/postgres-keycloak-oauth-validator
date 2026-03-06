@@ -33,6 +33,7 @@ jobs:
           docker build \
             --target builder \
             -t entra-validator-builder \
+            --build-arg PG_MAJOR=18 \
             -f docker/Dockerfile \
             .
           mkdir -p test/so

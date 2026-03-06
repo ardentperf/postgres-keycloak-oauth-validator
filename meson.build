@@ -9,13 +9,12 @@ project(
 pg_config = find_program('pg_config')
 includedir_server = run_command(pg_config, '--includedir-server', check: true).stdout().strip()
 
-# PostgreSQL is required for standard build
-postgres = dependency('libpq')
+# Get the libdir for linking against PostgreSQL
+libdir_server = run_command(pg_config, '--pkglibdir', check: true).stdout().strip()
 
 # The library is built as a shared object since it's going to be
 # loaded into PostgreSQL later as an extension.
 # Setting the prefix to '' avoids a `lib` prefix on the final file.
 shared_module('entra_validator', 'src/entra_validator.c',
-              dependencies: [postgres],
               include_directories: [includedir_server],
               name_prefix: '')
